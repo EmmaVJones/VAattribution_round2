@@ -1,0 +1,68 @@
+---
+title: "Data Organization for the VA Attribution Workshop- Round 2"
+output: html_notebook
+---
+
+This notebook walks you through the data organization steps necessary to compile macroinvertebrate, fish, and environmental data from Virginia, West Virginia, Maryland, and Fairfax County (VA) for the 2018 Attribution workshop. After the March 2018 workshop dates, the group realized a fair bit of data was still missing, incorrect, and we decided to bring in Maryland's dataset. The Rnotebook details this process. 
+
+All organization and analyses were run in R version 3.4.4. 
+
+
+# Fairfax Data
+
+Step 1: Working with Fairfax data, combine bug results. Use the *bugs_1_combineVAandFF.R* script. This script generates the *processedData/EDASandFF_bugData.csv* file.
+Step 2: Combine VA and Fairfax fish with *fish_1_combineVAandFF.R*. This script generates the *processedData/EDASandFairfax_fishData.csv* file.
+Step 3: Combine VA and Fairfax chemistry data with *env_1_combineVAandFF.R*. This script generates the *processedData/VAandFairfax_envData.csv* file.
+  + DO I NEED TO FILTER ENV DATA TO JUST SITES WITH BUG AND FISH DATA LIKE WITH WVA?
+Step 4: Make spatial dataset from environmental sites to display in leaflet map.
+
+
+# West Virginia Data
+
+Step 1: Working with West Virginia data, combine bug results. Use the *bugs_2_combineVAandWVA.R* script. This script generates the *processedData/VA_FF_WVA_bugData.csv* file.
+Step 2: Combine VA and WVA fish with *fish_2_combineVAandWVA.R*. This script generates the *processedData/VA_FF_WVA_fishData.csv* file.
+Step 3: Combine VA and WVA chemistry data with *env_2_combineVAandWVA.R*. This script generates the *processedData/VA_FF_WVA_envData.csv* file.
+
+
+# Maryland Data
+
+Step 1: Working with Maryland data, combine bug results. Use the *bugs_3_combineVAandMD.R* script. This script generates the *processedData/VA_FF_WVA_MD_bugData.csv* file.
+Step 2: Combine VA and MD fish with *fish_3_combineVAandMD.R*. This script generates the *processedData/VA_FF_WVA_MD_fishData.csv* file.
+Step 3: Combine VA and MD chemistry data with *env_3_combineVAandMD.R*. This script generates the *processedData/VA_FF_WVA_MD_envData.csv* file.
+
+
+# Other Data sources (INSTAR, NRSA, RMN, MAHA, MAIA)
+Step 1: Combine environmental results. Use the *env_4_combineOther.R* script. This script generates the *processedData/VA_FF_WVA_MD_Other_envData.csv* file.
+Step 2: Combine bug results. Use the *bugs_4_combineOther.R* script. This script generates the *processedData/VA_FF_WVA_MD_Other_bugData.csv* file.
+Step 3: Combine fish results. Use the *fish_4_combineOther.R* script. This script generates the *processedData/VA_FF_WVA_MD_Other_fishData.csv* file.
+
+
+
+# FINAL DATA
+
+### Only keep bug and fish data with associated environmental data
+- Read in 'final' bug (*processedData/VA_FF_WVA_MD_bugData.csv*) and fish (*processedData/VA_FF_WVA_MD_fishData.csv*) datasets from all partners, filter results to the final list of environmental parameters (*data/processedData/VA_FF_WVA_MD_envData.csv*). Use the script named *finalBug_Fish.R* to generate the *processedData/finalBugData.csv* and *processedData/finalFishData.csv* files.
+
+# Split final final bug data into spring and fall datasets
+- Make sure you split bug data into appropriate season using *bugs_splitIntoSpringAndFall.R* script.
+
+
+# Make spatial Dataset
+- Use the *spatialDataset_forleafletMap.R* to make the appropriate spatial info for leaflet maps in the app
+
+
+# Run stats
+
+- Titan analyses were skipped for the second round of this project because it took too much computer power to run for all taxa/stressors.
+
+## Fish analyses
+- Use FishAnalyses.Rmd notebook to walk through running all CDF and GAMs. 
+
+## Spring Bug analyses
+- Use SpringBugAnalyses.Rmd notebook to walk through running all CDF and GAMs. 
+
+
+## Fall Bug analyses
+
+
+

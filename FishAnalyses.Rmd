@@ -1,0 +1,1254 @@
+---
+title: "Attribution Workshop Fish Analyses"
+author: "Emma Jones"
+output: html_notebook
+---
+  
+This notebook walks users through the process of organizing data and running the CDF, GAM, and TITAN models on VDEQ fish data (and data from other entities) for the VDEQ species attribution workshop.
+
+Data processing
+```{r,echo=F,message=F}
+library(tidyverse)
+library(plotly)
+library(reshape)
+library(Hmisc)
+library(mgcv)
+#library(TITAN2)
+```
+
+Read in taxa data. Split dataset into environmental and taxa information. This dataset was created by merging all EDAS fish data with probmetrics dataset 2001-2014.
+```{r, echo=FALSE}
+fishData <- read_csv('data/processedData/finalFishData.csv') 
+fishData <- as.data.frame(fishData)
+envData <- read_csv('data/processedData/VA_FF_WVA_MD_Other_envData.csv') %>%
+  select(UID,DataSource,StationID,Year,LongitudeDD,LatitudeDD,totalArea_sqMile,
+         Basin,SubBasin,EcoRegion,BioRegion,DO,pH,SpCond,TN,TP,TotHab,
+         TotHab_wMD,Cl,Sf, ## PARAMETERS ADDED FOR ROUND TWO OF ANALYSES
+         LRBS,MetalCCU,wshdImpPCT)
+envData[envData=="NA"]=NA
+envData[12:23] <- apply(envData[12:23], 2, function(x) as.numeric(as.character(x)))
+envData <- as.data.frame(envData)
+
+fishTaxa <- select(fishData,UID,`Acantharchus pomotis`:`Umbra pygmaea`)
+fishTaxa <- as.data.frame(fishTaxa)
+fishTaxa[2:193] <- apply(fishTaxa[2:193], 2, function(x) as.numeric(as.character(x)))
+```
+
+
+```{r envDataQA, echo=FALSE}
+# Get rid of odd measures
+weirdDO <- filter(envData, DO > 14) 
+weirdpH <- filter(envData, pH > 14 & pH < 0) 
+weirdSpCond <- filter(envData, SpCond > 5000)
+weirdTN <- filter(envData, TN > 5)
+weirdTP <- filter(envData, TP > 1)
+weirdTotHab <- filter(envData, TotHab < 0 | TotHab > 200)
+weirdTotHab_wMD <- filter(envData, TotHab_wMD < 0 | TotHab_wMD > 200)
+weirdLRBS <- filter(envData, LRBS < -4 | LRBS > 2)
+weirdwshdImpPCT <- filter(envData, wshdImpPCT < 0 | wshdImpPCT > 100)
+rm(weirdpH);rm(weirdSpCond);rm(weirdTN);rm(weirdTP);rm(weirdTotHab);rm(weirdTotHab_wMD);rm(weirdLRBS);rm(weirdwshdImpPCT)
+
+# if these are worth dropping, then do next step 
+sitesToDrop <- c(weirdDO$UID)#,weirdpH$UID,#weirdSpCond$UID,weirdTN$UID,weirdTP$UID,weirdTotHab$UID,weirdLRBS$UID,weirdwshdImpPCT$UID)
+
+envData <- filter(envData, !(UID %in% sitesToDrop))
+
+
+```
+
+
+### CDF
+Function to output calculate cumlative percentiles for any input dataset.
+```{r, echo= F}
+# Testing parameters
+#dataset <- fishTaxa
+#parameter <- select(envData,UID,DO)
+#parameter <- 'DO'
+#taxaAndEnvdataset <-  merge(fishTaxa,select(envData,UID,DO),by='UID')
+  
+CDF <- function(taxaAndEnvdataset,parameter){
+  #dataset <- merge(dataset,parameter,by='UID')
+  dataset <- taxaAndEnvdataset[order(taxaAndEnvdataset[, parameter]), ]
+  value <- dataset[, parameter]
+  taxa.names <- sort(names(select(dataset,-UID)))
+  for(i in 1:length(taxa.names)){
+    csum <- cumsum(dataset[,taxa.names[i]]) / sum(dataset[,taxa.names[i]])
+  dataset <- cbind(dataset,csum)
+  names(dataset)[length(taxa.names)+1+i] <- paste('csum_',taxa.names[i],sep="")}
+  dataset <- mutate(dataset,parameter=parameter, value=value) %>%
+    select(UID,parameter,value,everything())
+  return(dataset)
+}
+
+# How to run function
+#cdfdata <- CDF(dataset,select(envData,UID,DO))
+#cdfdata <- CDF(merge(fishTaxa,select(envData,UID,DO),by='UID'),'DO')
+
+# Testing Parameters
+#CDFdataset <- cdfdata
+#taxaName <- "Acantharchus  pomotis"
+#percentile <- 0.75
+#options(warn = -1)
+
+CDFplot <- function(CDFdataset,taxaName){
+  # Double spaces are a pain
+  keep <- c('parameter','value', paste('csum_',taxaName,sep=""))
+  ggData <- CDFdataset[,match(keep,names(CDFdataset))] %>%
+    dplyr::rename(pct=!!names(.[3]))
+  plot_ly(ggData) %>%
+    add_trace(x = ~value, y = ~pct, mode = 'scatter', name=taxaName,
+                  hoverinfo="text",text=~paste(format(pct,digits=2)," , ",format(value,digits=2))) %>%
+    layout(showlegend = FALSE,
+         title=taxaName,
+         xaxis = list(title = "Proportion of Total"),
+         yaxis = list(title = ggData$parameter[1]))
+   #ggplot(ggData,aes(value,pct)) + geom_line() +
+   # theme(plot.title = element_text(size=20, face="bold", margin = margin(10, 0, 10, 0))) + 
+    #labs(x=ggData$parameter[1],y="Proportion of Total",title=taxaName) 
+ 
+} 
+
+# How to run function
+#CDFplot(cdfdata,names(cdfdata)[15])
+
+```
+
+
+Nonparametric Regression- Generalized Additive Model. This function is adapted from Lei Zheng (lei.zheng@tetratech.com) scripts for plots with the GAM and relative abundace.
+```{r, echo= F}
+options(scipen=10)
+
+
+tolerance <- function(spdata, envdata,  sp.siteid="Sample.ID", species="GENUS", 
+                      sp.abndid="RA", env.siteid="Sample.ID", xvar="cond", 
+                      cutoff = 20, cutoff2 = 10, region = "all", lim ="GAM",
+                      coord = NULL, mtype = 3, dense.N = 201, cast = TRUE,  
+                      plot.pdf = F, add.map=F,statename = NULL,  add.lab = F, 
+                      add.abund = T, ylab1 = "Capture Probability",  
+                      ylab2 = "Relative Abundance", 
+                      main = "Capture Probability of Macroinvertebrate Taxon Along Conductivity Gradient", 
+                      mar = c(5,4,3, 4), 
+                      xlabs=expression(paste("Conductivity ( ", mu, "S/cm)")), 
+                      log.x = TRUE, base = 10, plus = F, rounder = 2, taus = c(50,95), 
+                      nbin = 60, emmaLOG = FALSE) {
+  
+  print(xvar)
+  dfenv <- envdata[!is.na(envdata[,xvar]), c(env.siteid, xvar, coord)] 
+  if(cast) { 
+    df.sp <- data.frame(SITEID = spdata[, sp.siteid], species = spdata[, species],
+                        abund = spdata[, sp.abndid]) 
+    df.sp <- subset(df.sp, !is.na(species) & !is.na(abund))
+    df.tmp <- merge(df.sp, dfenv, by.x = "SITEID", by.y = env.siteid )
+    ss <- reshape::cast(df.tmp, SITEID ~ species, sum, value = "abund") 
+    names(ss)[1] <- sp.siteid
+  } else ss <- spdata
+  #    print(names(ss))
+  df1 <- merge(ss, dfenv, by.x = sp.siteid, by.y = env.siteid)   # merged crosstab abundance file
+  nc <- ncol(df1)
+  taxa.count <- apply(df1[,(2:ncol(ss))] > 0, 2, sum)
+  #    print((taxa.count))
+  tnames <- names(taxa.count)[taxa.count >= cutoff2] 
+  ntaxa <- length(tnames)                           # length of taxa list for taxonomic level i
+  
+  df2 <- df1 <- df1[order(df1[,xvar]),]
+  
+  df2[2:(nc-ncol(dfenv) + 1)] <- apply(df2[2:(nc-ncol(dfenv) + 1 )] > 0, 2, as.numeric)                 # p/a file
+  
+  stress <- df1[, xvar]
+  stress.u <- sort(unique(stress))
+  
+  xrange <- range(stress)
+  xnew <- seq(from = xrange[1], to = xrange[2], length = 100)
+  
+  ###### calculate weight for cdf 
+  
+  cutp <- seq(from = min(stress), to = max(stress), length = nbin)
+  cutm <- 0.5*(cutp[-1] + cutp[-nbin])
+  
+  df2$cutf <- cut(df2[,xvar], cutp, include.lowest = T)
+  
+  wt <- 1/table(df2$cutf)
+  wt[is.infinite(wt)] <- NA
+  wt <- wt/sum(wt, na.rm = T)
+  dftemp <- data.frame(cutf = names(wt), wt = as.vector(wt))
+  df2 <- merge(df2, dftemp, by = "cutf")[-1]
+  df2 <- df2[order(df2[,xvar]),]  
+  df1 <- df1[order(df1[,xvar]),] 
+  
+  #### end 
+  ##### function to compute area under the curve
+  auc <- function(xrange, mod, dense.N) {
+    x <- seq(min(xrange), max(xrange), length = dense.N - 1)
+    s.area <-rep(NA, dense.N - 1)
+    y <- predict(mod, newdata = data.frame(dose = x), type = "response")
+    for (index in 1:dense.N-1) {
+      s.area[index] <- (y[index] + y[index + 1])/2*(x[index+1]-x[index])
+    }
+    tsum <- sum(s.area, na.rm=T)         # all area
+    jj=1
+    csum = sum(s.area[1:jj])              # cum area
+    xc95 <- yc95 <- rep(NA, length(taus))
+    for(ii in 1:length(taus)) {
+      while(csum < taus[ii]/100*tsum) {
+        jj = jj + 1
+        csum <- sum(s.area[1:jj], na.rm=T)
+      }
+      if(jj == 1) {
+        xc95[ii] <- x[jj]
+        yc95[ii] <- y[jj]
+      } else {
+        xc95[ii] <- (x[jj]+ x[jj-1])/2  
+        yc95[ii] <- (y[jj]+ y[jj-1])/2
+      }
+    }
+    return(c(xc95))
+    #      print(xc95)
+  } 
+  # plot pdf option
+  #if(plot.pdf) {
+  #  pdf(file = paste("data/", region, ".taxon.gam.pdf",sep=""),
+  #      width = 9, height = 6.5, pointsize = 12)
+  #  par(mfrow = c(2, 3), pty = "m", mar =mar, oma=c(1.5, 0.5, 2,0.5) )
+  #  totpage <- ceiling((length(tnames)+1)/6)
+  #  
+  #  if(add.map) {
+  #    simpleCap <- function(x) {
+  #      s <- strsplit(x, " ")[[1]]
+  #      paste(toupper(substring(s, 1,1)), substring(s, 2),
+  #            sep="", collapse=" ")
+  #    }
+  #    med = 1
+  #    while(is.na(df1[med, coord[1]])) med = 1 + med
+  #    
+  #    if(is.null(statename)) {
+  #      statename <<- map.where("state", df1[med, coord[1]], df1[med, coord[2]])
+  #      statename <- simpleCap(statename)
+  #    } 
+  #    if(add.lab) {
+  #      map.text("state", region = statename, mar = mar)
+  #    } else {
+  #      map("state", regions = statename, mar = mar)
+  #    }
+  #    
+  #    text(df1[,coord[1]],df1[,coord[2]],".")
+  #    #       mtext(paste("Ecoregion",region), side =3,line = 0.5, cex=1.5)  
+  #  }
+  #}
+  
+  varnames <- c("N", "min_ob", paste(taus, "th_ob",sep="_"), "max_ob", "Opt_WA",
+                "Tol_WA", paste("CDF", taus,"th","Abund", sep ="_"),
+                paste("CDF", taus,"th","PA", sep ="_"),paste("CDF_wt", taus,"th",sep ="_"), 
+                paste("LRM", taus,"th", sep ="_"),paste("QLRM", taus,"th", sep ="_"),
+                "Opt_qlrm", "Tol_qlrm", paste("GAM",taus, "th", sep="_"), "ROC")
+  
+  optsave <- matrix(NA, ncol = length(taus)*7 + 8, nrow  = ntaxa)
+  colnames(optsave) <- varnames
+  rownames(optsave) <- tnames
+  
+  for (i in 1:ntaxa) {
+    isel <- match(tnames[i], names(df1))       # selected taxa i
+    #    print(df1[,isel])
+    print(tnames[i])
+    ### (0) observed range
+    samplen <- length(df2[df2[,isel]>0,xvar])          
+    limits <- quantile(df2[df2[,isel]>0,xvar], prob = c(0, taus/100, 1))       
+    
+    ## (1)  Weighted averaging 
+    WA <- sum(df1[,isel]*df1[,xvar])/sum(df1[,isel]) 
+    tol <- sqrt(sum(df1[,isel] * (df1[,xvar]- WA)^2) /sum(df1[,isel])) 
+    #    WTA <- sum(df1[,isel]*df1[,xvar]*df2$wt)/sum(df1[,isel]*df2$wt)     # sample weighted weighted average         
+    
+    ### (2)  cdf or cumsum no weighting  both abundance based and p/a based
+    csum1 <-cumsum(df1[,isel])/sum(df1[,isel])          # cumlative vectors devided total abundance 
+    #      print(sum(df1[,isel]))
+    ic1 <- rep(1, length(taus))
+    for(ii in 1:length(taus)) {
+      #  print(csum1)
+      if(is.finite(csum1[ic1[ii]])) {
+        while(csum1[ic1[ii]] < taus[ii]/100) ic1[ii] <- ic1[ii] + 1
+      } else csum1 <- NA
+    }
+    #### (3) cdf p/a        
+    csum2 <-cumsum(df2[,isel])/sum(df2[,isel])    # cumlative vectors devided total abundance 
+    ic2 <- rep(1, length(taus))
+    for(ii in 1:length(taus)) {
+      while(csum1[ic2[ii]] < taus[ii]/100) ic2[ii]<- ic2[ii] + 1
+    }
+    
+    ##### (4) cdf weighted 
+    pres <- df2[, isel] > 0
+    sel <- df2[pres,]
+    eout2 <- rep(NA, length(taus))
+    for(ii in 1:length(taus)) {
+      eout2[ii] <- Hmisc::wtd.quantile(sel[,xvar], sel$wt, normwt = TRUE, prob = taus[ii]/100)  
+    }
+    
+    ######### (5)(6)(7) logistic regression model          
+    resp <<- df2[, isel] 
+    dose <<- df2[, xvar]
+    lrm1 <- glm(resp ~ dose, family="binomial")
+    lrm2 <- glm(resp ~ dose + I(dose^2), family="binomial")
+    #### u = -b1/(2b2)  t = 1/sqrt(-2b2) for lrm2  
+    lrm2.opt <- (-lrm2$coef[2]/(2*lrm2$coef[3])  )
+    lrm2.tol <- 1/sqrt(-2*as.vector(lrm2$coef[3]))
+    s=mgcv:::s
+    
+    lrm3 <- try(mgcv::gam(resp ~ s(dose,k = 3), family= "binomial"),TRUE)
+    
+    if(isTRUE(class(lrm3)=="try-error")) { next } else{  ############################ ERROR HANDLING INSERTED BY EVJ 02062018
+    
+    if(mtype == 1) model <- lrm1
+    if(mtype == 2) model <- lrm2
+    if(mtype == 3) model <- lrm3
+
+    # Compute mean predicted probability of occurrence
+    predlk <- predict(model, type = "link")
+    predout <- exp(predlk)/(1 + exp(predlk))
+    x <- predout[pres]
+    y <- predout[!pres]
+    rocmat <- matrix(NA, nrow = length(x), ncol = length(y))
+    for (j in 1:length(x)) {
+      rocmat[j,] <- as.numeric(x[j] > y)
+    }
+    # Summarize all comparisons to compute area under ROC
+    roc <- sum(rocmat)/(length(x)*length(y))
+    #        wilcox <- wilcox.test(x, y, conf.int = FALSE)
+    predresp <- predict(model, newdata = data.frame(dose=xnew), type="link", se.fit=T)
+    
+    # Compute upper and lower 90% confidence limits
+    up.bound.link <- predresp$fit + qnorm(0.95)*predresp$se.fit
+    low.bound.link <- predresp$fit + qnorm(0.05)*predresp$se.fit
+    mean.resp.link <- predresp$fit
+    
+    # Convert from logit transformed values to probability.
+    up.bound <- exp(up.bound.link)/(1+exp(up.bound.link))
+    low.bound <- exp(low.bound.link)/(1+exp(low.bound.link))
+    mean.resp <- exp(mean.resp.link)/(1+exp(mean.resp.link))
+    
+    #### 5,6,7 full range
+    ######## find modeled xc95 full data range
+    lrm1.95f <- auc(xrange = xrange, mod = lrm1, dense.N = dense.N)
+    lrm2.95f <- auc(xrange = xrange, mod = lrm2, dense.N = dense.N)
+    lrm3.95f <- auc(xrange = xrange, mod = lrm3, dense.N = dense.N) 
+    #        print(lrm3.95f)
+    ###### Save results 
+    
+    optsave[i,] <- c(samplen, round(c(limits, WA, tol, df1[ic1,xvar],
+                                      df1[ic2,xvar], eout2, lrm1.95f,lrm2.95f, lrm2.opt, lrm2.tol, lrm3.95f),rounder), roc)
+    
+    #### The following code calcualte probabilities of occurrence
+    binf <- cut(df2[,xvar], cutp, include.lowest = T)
+    bvals <- tapply(df2[, isel] > 0, binf, mean, na.rm =T)
+    
+    if(plot.pdf) {
+        ## Special Plot for log scale bc I can't get the original log scale to work properly 05212018
+        if(emmaLOG==TRUE){
+          file_name <- paste('FinalDataAndPlots/Fish/',lim,'/',xvar,'/',tnames[i],'.jpg',sep='')
+          jpeg(file_name)
+          par(mar =mar, oma=c(1.5, 0.5, 2,0.5) )
+          typ <- ifelse(samplen >= cutoff, "l", "n")
+          if(xvar== "wshdImpPCT"){xrange[1] <- c(0.5)} # can't have 0 for log x scale #########################################
+          plot(xnew, mean.resp, axes = TRUE, type = typ, xlab = "", ylab = "", xlim= xrange,
+               ylim = range(low.bound, up.bound, bvals, na.rm =T), col=1, log='x')
+          points(xnew, low.bound, type="l", col=1, lty="dashed")
+          points(xnew, up.bound, type="l", col=1, lty="dashed")
+          abline(v= lrm3.95f, lty= "dashed", col="red")
+          y1range <- range(low.bound, up.bound, bvals, na.rm =T)
+          y2range <- range(df1[, isel])
+          if(add.abund) {
+            y2new <- (df1[,isel] - min(y2range))*diff(y1range)/diff(y2range)+ min(y1range)    # convert y2 to y1 scale
+            y1new.at <- (axTicks(2) - min(y1range))*diff(y2range)/diff(y1range)+ min(df1[, isel])    # convert to y2 scale
+            y2.lab <- round(y1new.at, 3)    # add labels at original y2 scale
+            axis(4, at = axTicks(2), labels = y2.lab, tcl =-0.4, lwd.ticks = 1)    # major ticks with labels
+            points(dose, y2new, pch = 21, col = 1, cex = 0.3, bg = "lightgray")
+            mtext(ylab2, side = 4, line = 2.5, col=1 , cex = 0.9)
+          }    else {
+            points(cutm, bvals, pch=21, col= 1, cex = 0.7, bg ="gray")                      # probability
+          }
+          mtext(xlabs, side = 1, line = 2.3, cex = 0.9)
+          mtext(ylab1, side = 2, line = 2.3, cex = 0.9, col=1)
+          mtext(bquote(italic(.(tnames[i]))), side = 3, line = 0.5)
+          dev.off()
+        }else{
+          file_name <- paste('FinalDataAndPlots/Fish/',lim,'/',xvar,'/',tnames[i],'.jpg',sep='')
+          jpeg(file_name)
+          par(mar =mar, oma=c(1.5, 0.5, 2,0.5) )
+          typ <- ifelse(samplen >= cutoff, "l", "n")
+          plot(xnew, mean.resp, axes = FALSE, type = typ, xlab = "", ylab = "", xlim= xrange,
+               ylim = range(low.bound, up.bound, bvals, na.rm =T), col=1)
+          
+          if(samplen >= cutoff) {
+            points(xnew, low.bound, type="l", col=1, lty="dashed")
+            points(xnew, up.bound, type="l", col=1, lty="dashed")
+            if(!is.na(lim)) {  #  plot limits
+              if(lim =="GAM") { 
+                abline(v= lrm3.95f, lty= "dashed", col="red")
+              } else if(lim =="CDF"){
+                abline(v= eout2, lty= "dashed", col="blue")
+              }
+            }
+          }   
+          max.pow <- ceiling(max(xrange)); min.pow <- floor(min(xrange))  ## add x range for log formation    
+          
+          if(log.x) {
+            at0 <- min.pow:max.pow              # add ticks at log10 = even     
+            lab1 <- base^at0          # could be base = exp(1)
+            axis(1, at = log(lab1 + plus, base), labels = lab1, lwd.ticks = 1)    # major ticks with labels
+            xtick <- at0 <= max(df1[,xvar]) & at0 >= min(df1[,xvar])          # major labels
+            
+            if(sum(xtick) <5) {
+              axis(1, at = log((1:10 * rep(lab1[-1]/10, each = 10)) + plus, base ), tcl = -0.4, 
+                   labels = FALSE, lwd.ticks = 0.8)  # minor ticks            xtick <- at0 <= max(x) & axis.at >= xmin          # major labels
+            }
+            ### if only two or fewer major lables, then add tick labels at 2 and 5 log
+            if(sum(xtick)==2) {
+              at1 <- log(3 * rep(lab1[-1]/10, each = 1) + plus, base)
+              axis(1, at = at1, tcl = -0.3, lwd.ticks= 1, labels = (3 * rep(lab1[-1]/10, each = 1)),
+                   tcl = - 0.4)
+            }   else if (sum(xtick)<2) {
+              at2 <- log(c(2, 5) * rep(lab1[-1]/10, each = 2) + plus, base)
+              axis(1, at = at2, tcl = -0.3, lwd.ticks= 1, labels = (c(2, 5) * 
+                                                                      rep(lab1[-1]/10, each = 2)))
+            }            
+          } else  {
+            axis(1, at = pretty(xrange), labels = pretty(xrange), lwd.ticks = 1, las = 1)    # major ticks with labels
+          }
+          axis(2)
+          y1range <- range(low.bound, up.bound, bvals, na.rm =T)
+          y2range <- range(df1[, isel])
+          if(add.abund) {
+            y2new <- (df1[,isel] - min(y2range))*diff(y1range)/diff(y2range)+ min(y1range)    # convert y2 to y1 scale
+            y1new.at <- (axTicks(2) - min(y1range))*diff(y2range)/diff(y1range)+ min(df1[, isel])    # convert to y2 scale
+            y2.lab <- round(y1new.at, 3)    # add labels at original y2 scale
+            axis(4, at = axTicks(2), labels = y2.lab, tcl =-0.4, lwd.ticks = 1)    # major ticks with labels
+            points(dose, y2new, pch = 21, col = 1, cex = 0.3, bg = "lightgray")
+            mtext(ylab2, side = 4, line = 2.5, col=1 , cex = 0.9)
+          }    else {
+            points(cutm, bvals, pch=21, col= 1, cex = 0.7, bg ="gray")                      # probability
+          }
+          
+          mtext(xlabs, side = 1, line = 2.3, cex = 0.9)
+          mtext(ylab1, side = 2, line = 2.3, cex = 0.9, col=1)
+          mtext(bquote(italic(.(tnames[i]))), side = 3, line = 0.5)
+          box() 
+          
+          #if((i+5)/6-round((i+5)/6)==0) {
+          #  title(main= main, outer=TRUE, cex.main= 1.8) 
+          #  mtext(paste("Page", (i+5)/6, "of", totpage), outer = TRUE, side =1)
+          #}
+          
+          dev.off()
+        }
+        
+        
+      }
+    
+    }
+  }
+  if(plot.pdf) graphics.off()
+  return(optout <- data.frame(tnames, optsave))
+}
+
+
+
+
+
+
+
+
+tolerance_bioregion <- function(spdata, envdata,  sp.siteid="Sample.ID", species="GENUS", 
+                      sp.abndid="RA", env.siteid="Sample.ID", xvar="cond", 
+                      cutoff = 20, cutoff2 = 10, region = "all", lim ="GAM",
+                      coord = NULL, mtype = 3, dense.N = 201, cast = TRUE,  
+                      plot.pdf = F, add.map=F,statename = NULL,  add.lab = F, 
+                      bioregion = 'Mountain',
+                      add.abund = T, ylab1 = "Capture Probability",  
+                      ylab2 = "Relative Abundance", 
+                      main = "Capture Probability of Macroinvertebrate Taxon Along Conductivity Gradient", 
+                      mar = c(5,4,3, 4), 
+                      xlabs=expression(paste("Conductivity ( ", mu, "S/cm)")), 
+                      log.x = TRUE, base = 10, plus = F, rounder = 0, taus = c(50,95), 
+                      nbin = 60, emmaLOG = FALSE) {
+  
+  print(xvar)
+  dfenv <- envdata[!is.na(envdata[,xvar]), c(env.siteid, xvar, coord)] 
+  if(cast) { 
+    df.sp <- data.frame(SITEID = spdata[, sp.siteid], species = spdata[, species],
+                        abund = spdata[, sp.abndid]) 
+    df.sp <- subset(df.sp, !is.na(species) & !is.na(abund))
+    df.tmp <- merge(df.sp, dfenv, by.x = "SITEID", by.y = env.siteid )
+    ss <- reshape::cast(df.tmp, SITEID ~ species, sum, value = "abund") 
+    names(ss)[1] <- sp.siteid
+  } else ss <- spdata
+  #    print(names(ss))
+  df1 <- merge(ss, dfenv, by.x = sp.siteid, by.y = env.siteid)   # merged crosstab abundance file
+  nc <- ncol(df1)
+  taxa.count <- apply(df1[,(2:ncol(ss))] > 0, 2, sum)
+  #    print((taxa.count))
+  tnames <- names(taxa.count)[taxa.count >= cutoff2] 
+  ntaxa <- length(tnames)                           # length of taxa list for taxonomic level i
+  
+  df2 <- df1 <- df1[order(df1[,xvar]),]
+  
+  df2[2:(nc-ncol(dfenv) + 1)] <- apply(df2[2:(nc-ncol(dfenv) + 1 )] > 0, 2, as.numeric)                 # p/a file
+  
+  stress <- df1[, xvar]
+  stress.u <- sort(unique(stress))
+  
+  xrange <- range(stress)
+  xnew <- seq(from = xrange[1], to = xrange[2], length = 100)
+  
+  ###### calculate weight for cdf 
+  
+  cutp <- seq(from = min(stress), to = max(stress), length = nbin)
+  cutm <- 0.5*(cutp[-1] + cutp[-nbin])
+  
+  df2$cutf <- cut(df2[,xvar], cutp, include.lowest = T)
+  
+  wt <- 1/table(df2$cutf)
+  wt[is.infinite(wt)] <- NA
+  wt <- wt/sum(wt, na.rm = T)
+  dftemp <- data.frame(cutf = names(wt), wt = as.vector(wt))
+  df2 <- merge(df2, dftemp, by = "cutf")[-1]
+  df2 <- df2[order(df2[,xvar]),]  
+  df1 <- df1[order(df1[,xvar]),] 
+  
+  #### end 
+  ##### function to compute area under the curve
+  auc <- function(xrange, mod, dense.N) {
+    x <- seq(min(xrange), max(xrange), length = dense.N - 1)
+    s.area <-rep(NA, dense.N - 1)
+    y <- predict(mod, newdata = data.frame(dose = x), type = "response")
+    for (index in 1:dense.N-1) {
+      s.area[index] <- (y[index] + y[index + 1])/2*(x[index+1]-x[index])
+    }
+    tsum <- sum(s.area, na.rm=T)         # all area
+    jj=1
+    csum = sum(s.area[1:jj])              # cum area
+    xc95 <- yc95 <- rep(NA, length(taus))
+    for(ii in 1:length(taus)) {
+      while(csum < taus[ii]/100*tsum) {
+        jj = jj + 1
+        csum <- sum(s.area[1:jj], na.rm=T)
+      }
+      if(jj == 1) {
+        xc95[ii] <- x[jj]
+        yc95[ii] <- y[jj]
+      } else {
+        xc95[ii] <- (x[jj]+ x[jj-1])/2  
+        yc95[ii] <- (y[jj]+ y[jj-1])/2
+      }
+    }
+    return(c(xc95))
+    #      print(xc95)
+  } 
+  # plot pdf option
+  #if(plot.pdf) {
+  #  pdf(file = paste("data/", region, ".taxon.gam.pdf",sep=""),
+  #      width = 9, height = 6.5, pointsize = 12)
+  #  par(mfrow = c(2, 3), pty = "m", mar =mar, oma=c(1.5, 0.5, 2,0.5) )
+  #  totpage <- ceiling((length(tnames)+1)/6)
+  #  
+  #  if(add.map) {
+  #    simpleCap <- function(x) {
+  #      s <- strsplit(x, " ")[[1]]
+  #      paste(toupper(substring(s, 1,1)), substring(s, 2),
+  #            sep="", collapse=" ")
+  #    }
+  #    med = 1
+  #    while(is.na(df1[med, coord[1]])) med = 1 + med
+  #    
+  #    if(is.null(statename)) {
+  #      statename <<- map.where("state", df1[med, coord[1]], df1[med, coord[2]])
+  #      statename <- simpleCap(statename)
+  #    } 
+  #    if(add.lab) {
+  #      map.text("state", region = statename, mar = mar)
+  #    } else {
+  #      map("state", regions = statename, mar = mar)
+  #    }
+  #    
+  #    text(df1[,coord[1]],df1[,coord[2]],".")
+  #    #       mtext(paste("Ecoregion",region), side =3,line = 0.5, cex=1.5)  
+  #  }
+  #}
+  
+  varnames <- c("N", "min_ob", paste(taus, "th_ob",sep="_"), "max_ob", "Opt_WA",
+                "Tol_WA", paste("CDF", taus,"th","Abund", sep ="_"),
+                paste("CDF", taus,"th","PA", sep ="_"),paste("CDF_wt", taus,"th",sep ="_"), 
+                paste("LRM", taus,"th", sep ="_"),paste("QLRM", taus,"th", sep ="_"),
+                "Opt_qlrm", "Tol_qlrm", paste("GAM",taus, "th", sep="_"), "ROC")
+  
+  optsave <- matrix(NA, ncol = length(taus)*7 + 8, nrow  = ntaxa)
+  colnames(optsave) <- varnames
+  rownames(optsave) <- tnames
+  
+  for (i in 1:ntaxa) {
+    isel <- match(tnames[i], names(df1))       # selected taxa i
+    #    print(df1[,isel])
+    print(tnames[i])
+    ### (0) observed range
+    samplen <- length(df2[df2[,isel]>0,xvar])          
+    limits <- quantile(df2[df2[,isel]>0,xvar], prob = c(0, taus/100, 1))       
+    
+    ## (1)  Weighted averaging 
+    WA <- sum(df1[,isel]*df1[,xvar])/sum(df1[,isel]) 
+    tol <- sqrt(sum(df1[,isel] * (df1[,xvar]- WA)^2) /sum(df1[,isel])) 
+    #    WTA <- sum(df1[,isel]*df1[,xvar]*df2$wt)/sum(df1[,isel]*df2$wt)     # sample weighted weighted average         
+    
+    ### (2)  cdf or cumsum no weighting  both abundance based and p/a based
+    csum1 <-cumsum(df1[,isel])/sum(df1[,isel])          # cumlative vectors devided total abundance 
+    #      print(sum(df1[,isel]))
+    ic1 <- rep(1, length(taus))
+    for(ii in 1:length(taus)) {
+      #  print(csum1)
+      if(is.finite(csum1[ic1[ii]])) {
+        while(csum1[ic1[ii]] < taus[ii]/100) ic1[ii] <- ic1[ii] + 1
+      } else csum1 <- NA
+    }
+    #### (3) cdf p/a        
+    csum2 <-cumsum(df2[,isel])/sum(df2[,isel])    # cumlative vectors devided total abundance 
+    ic2 <- rep(1, length(taus))
+    for(ii in 1:length(taus)) {
+      while(csum1[ic2[ii]] < taus[ii]/100) ic2[ii]<- ic2[ii] + 1
+    }
+    
+    ##### (4) cdf weighted 
+    pres <- df2[, isel] > 0
+    sel <- df2[pres,]
+    eout2 <- rep(NA, length(taus))
+    for(ii in 1:length(taus)) {
+      eout2[ii] <- Hmisc::wtd.quantile(sel[,xvar], sel$wt, normwt = TRUE, prob = taus[ii]/100)  
+    }
+    
+    ######### (5)(6)(7) logistic regression model          
+    resp <<- df2[, isel] 
+    dose <<- df2[, xvar]
+    lrm1 <- glm(resp ~ dose, family="binomial")
+    lrm2 <- glm(resp ~ dose + I(dose^2), family="binomial")
+    #### u = -b1/(2b2)  t = 1/sqrt(-2b2) for lrm2  
+    lrm2.opt <- (-lrm2$coef[2]/(2*lrm2$coef[3])  )
+    lrm2.tol <- 1/sqrt(-2*as.vector(lrm2$coef[3]))
+    s=mgcv:::s
+    
+    lrm3 <- try(mgcv::gam(resp ~ s(dose,k = 3), family= "binomial"),TRUE)
+    
+    if(isTRUE(class(lrm3)=="try-error")) { next } else{  ############################ ERROR HANDLING INSERTED BY EVJ 02062018
+    
+    if(mtype == 1) model <- lrm1
+    if(mtype == 2) model <- lrm2
+    if(mtype == 3) model <- lrm3
+
+    # Compute mean predicted probability of occurrence
+    predlk <- predict(model, type = "link")
+    predout <- exp(predlk)/(1 + exp(predlk))
+    x <- predout[pres]
+    y <- predout[!pres]
+    rocmat <- matrix(NA, nrow = length(x), ncol = length(y))
+    for (j in 1:length(x)) {
+      rocmat[j,] <- as.numeric(x[j] > y)
+    }
+    # Summarize all comparisons to compute area under ROC
+    roc <- sum(rocmat)/(length(x)*length(y))
+    #        wilcox <- wilcox.test(x, y, conf.int = FALSE)
+    predresp <- predict(model, newdata = data.frame(dose=xnew), type="link", se.fit=T)
+    
+    # Compute upper and lower 90% confidence limits
+    up.bound.link <- predresp$fit + qnorm(0.95)*predresp$se.fit
+    low.bound.link <- predresp$fit + qnorm(0.05)*predresp$se.fit
+    mean.resp.link <- predresp$fit
+    
+    # Convert from logit transformed values to probability.
+    up.bound <- exp(up.bound.link)/(1+exp(up.bound.link))
+    low.bound <- exp(low.bound.link)/(1+exp(low.bound.link))
+    mean.resp <- exp(mean.resp.link)/(1+exp(mean.resp.link))
+    
+    #### 5,6,7 full range
+    ######## find modeled xc95 full data range
+    lrm1.95f <- auc(xrange = xrange, mod = lrm1, dense.N = dense.N)
+    lrm2.95f <- auc(xrange = xrange, mod = lrm2, dense.N = dense.N)
+    lrm3.95f <- auc(xrange = xrange, mod = lrm3, dense.N = dense.N) 
+    #        print(lrm3.95f)
+    ###### Save results 
+    
+    optsave[i,] <- c(samplen, round(c(limits, WA, tol, df1[ic1,xvar],
+                                      df1[ic2,xvar], eout2, lrm1.95f,lrm2.95f, lrm2.opt, lrm2.tol, lrm3.95f),rounder), roc)
+    
+    #### The following code calcualte probabilities of occurrence
+    binf <- cut(df2[,xvar], cutp, include.lowest = T)
+    bvals <- tapply(df2[, isel] > 0, binf, mean, na.rm =T)
+    
+    
+    
+    
+    
+    if(plot.pdf) {
+      ## Special Plot for log scale bc I can't get the original log scale to work properly 05212018
+        if(emmaLOG==TRUE){
+          file_name <- paste('FinalDataAndPlots/Fish/Bioregion/',bioregion,'/',lim,'/',xvar,'/',tnames[i],'.jpg',sep='')
+          jpeg(file_name)
+          par(mar =mar, oma=c(1.5, 0.5, 2,0.5) )
+          typ <- ifelse(samplen >= cutoff, "l", "n")
+          if(xvar== "wshdImpPCT"){xrange[1] <- c(0.5)} # can't have 0 for log x scale ######################################
+          plot(xnew, mean.resp, axes = TRUE, type = typ, xlab = "", ylab = "", xlim= xrange,
+               ylim = range(low.bound, up.bound, bvals, na.rm =T), col=1, log='x')
+          points(xnew, low.bound, type="l", col=1, lty="dashed")
+          points(xnew, up.bound, type="l", col=1, lty="dashed")
+          abline(v= lrm3.95f, lty= "dashed", col="red")
+          y1range <- range(low.bound, up.bound, bvals, na.rm =T)
+          y2range <- range(df1[, isel])
+          if(add.abund) {
+            y2new <- (df1[,isel] - min(y2range))*diff(y1range)/diff(y2range)+ min(y1range)    # convert y2 to y1 scale
+            y1new.at <- (axTicks(2) - min(y1range))*diff(y2range)/diff(y1range)+ min(df1[, isel])    # convert to y2 scale
+            y2.lab <- round(y1new.at, 3)    # add labels at original y2 scale
+            axis(4, at = axTicks(2), labels = y2.lab, tcl =-0.4, lwd.ticks = 1)    # major ticks with labels
+            points(dose, y2new, pch = 21, col = 1, cex = 0.3, bg = "lightgray")
+            mtext(ylab2, side = 4, line = 2.5, col=1 , cex = 0.9)
+          }    else {
+            points(cutm, bvals, pch=21, col= 1, cex = 0.7, bg ="gray")                      # probability
+          }
+          mtext(xlabs, side = 1, line = 2.3, cex = 0.9)
+          mtext(ylab1, side = 2, line = 2.3, cex = 0.9, col=1)
+          mtext(bquote(italic(.(tnames[i]))), side = 3, line = 0.5)
+          dev.off()
+        }else{
+          file_name <- paste('FinalDataAndPlots/Fish/Bioregion/',bioregion,'/',lim,'/',xvar,'/',tnames[i],'.jpg',sep='')
+          jpeg(file_name)
+          par(mar =mar, oma=c(1.5, 0.5, 2,0.5) )
+          typ <- ifelse(samplen >= cutoff, "l", "n")
+          plot(xnew, mean.resp, axes = FALSE, type = typ, xlab = "", ylab = "", xlim= xrange,
+               ylim = range(low.bound, up.bound, bvals, na.rm =T), col=1)
+          
+          if(samplen >= cutoff) {
+            points(xnew, low.bound, type="l", col=1, lty="dashed")
+            points(xnew, up.bound, type="l", col=1, lty="dashed")
+            if(!is.na(lim)) {  #  plot limits
+              if(lim =="GAM") { 
+                abline(v= lrm3.95f, lty= "dashed", col="red")
+              } else if(lim =="CDF"){
+                abline(v= eout2, lty= "dashed", col="blue")
+              }
+            }
+          }   
+          max.pow <- ceiling(max(xrange)); min.pow <- floor(min(xrange))  ## add x range for log formation    
+          
+          if(log.x) {
+            at0 <- min.pow:max.pow              # add ticks at log10 = even     
+            lab1 <- base^at0          # could be base = exp(1)
+            axis(1, at = log(lab1 + plus, base), labels = lab1, lwd.ticks = 1)    # major ticks with labels
+            xtick <- at0 <= max(df1[,xvar]) & at0 >= min(df1[,xvar])          # major labels
+            
+            if(sum(xtick) <5) {
+              axis(1, at = log((1:10 * rep(lab1[-1]/10, each = 10)) + plus, base ), tcl = -0.4, 
+                   labels = FALSE, lwd.ticks = 0.8)  # minor ticks            xtick <- at0 <= max(x) & axis.at >= xmin          # major labels
+            }
+            ### if only two or fewer major lables, then add tick labels at 2 and 5 log
+            if(sum(xtick)==2) {
+              at1 <- log(3 * rep(lab1[-1]/10, each = 1) + plus, base)
+              axis(1, at = at1, tcl = -0.3, lwd.ticks= 1, labels = (3 * rep(lab1[-1]/10, each = 1)),
+                   tcl = - 0.4)
+            }   else if (sum(xtick)<2) {
+              at2 <- log(c(2, 5) * rep(lab1[-1]/10, each = 2) + plus, base)
+              axis(1, at = at2, tcl = -0.3, lwd.ticks= 1, labels = (c(2, 5) * 
+                                                                      rep(lab1[-1]/10, each = 2)))
+            }            
+          } else  {
+            axis(1, at = pretty(xrange), labels = pretty(xrange), lwd.ticks = 1, las = 1)    # major ticks with labels
+          }
+          axis(2)
+          y1range <- range(low.bound, up.bound, bvals, na.rm =T)
+          y2range <- range(df1[, isel])
+          if(add.abund) {
+            y2new <- (df1[,isel] - min(y2range))*diff(y1range)/diff(y2range)+ min(y1range)    # convert y2 to y1 scale
+            y1new.at <- (axTicks(2) - min(y1range))*diff(y2range)/diff(y1range)+ min(df1[, isel])    # convert to y2 scale
+            y2.lab <- round(y1new.at, 3)    # add labels at original y2 scale
+            axis(4, at = axTicks(2), labels = y2.lab, tcl =-0.4, lwd.ticks = 1)    # major ticks with labels
+            points(dose, y2new, pch = 21, col = 1, cex = 0.3, bg = "lightgray")
+            mtext(ylab2, side = 4, line = 2.5, col=1 , cex = 0.9)
+          }    else {
+            points(cutm, bvals, pch=21, col= 1, cex = 0.7, bg ="gray")                      # probability
+          }
+          
+          mtext(xlabs, side = 1, line = 2.3, cex = 0.9)
+          mtext(ylab1, side = 2, line = 2.3, cex = 0.9, col=1)
+          mtext(bquote(italic(.(tnames[i]))), side = 3, line = 0.5)
+          box() 
+          
+          #if((i+5)/6-round((i+5)/6)==0) {
+          #  title(main= main, outer=TRUE, cex.main= 1.8) 
+          #  mtext(paste("Page", (i+5)/6, "of", totpage), outer = TRUE, side =1)
+          #}
+          
+          dev.off()
+        }
+    }
+    
+    }
+  }
+  if(plot.pdf) graphics.off()
+  return(optout <- data.frame(tnames, optsave))
+}
+```
+
+
+And then one more function to help make with plot automation.
+```{r, echo=F}
+
+# function to get better x axis label
+prettyXlabel <- function(parameter){
+  if(parameter=="DO"){return('Dissolved Oxygen (mg/L)')}
+  if(parameter=="pH"){return('pH (Standard Units)')}
+  if(parameter=="SpCond"){return(expression(paste("Specific Conductivity ( ", mu, "S/cm)")))}
+  if(parameter=="TN"){return('Total Nitrogen (mg/L)')}
+  if(parameter=="TP"){return('Total Phosphorus (mg/L)')}
+  if(parameter=='TDS'){return('Total Dissolved Solids (mg/L)')}
+  if(parameter=="NH4"){return('Ammonia Nitrogen (mg/L)')}
+  if(parameter=="NO3"){return('Total Nitrate Nitrogen (mg/L)')}
+  if(parameter=="TKN"){return('Total Kjendahl Nitrogen (mg/L)')}
+  if(parameter=="Ortho-P"){return("Total Ortho-Phosphorus (mg/L)")}
+  if(parameter== "Turb" ){return('Turbidity (NTU)')}
+  if(parameter== "TSS" ){return('Total Suspended Solids (mg/L)')}
+  if(parameter=="Na"){return("Dissolved Sodium (mg/L)")}
+  if(parameter=="K"){return("Dissolved Potassium (mg/L)")}
+  if(parameter=="Cl"){return("Dissolved Chloride (mg/L)")}
+  if(parameter=="Sf"){return("Dissolved Sulfate (mg/L)")}
+  if(parameter=="70331VFine"){return("% Fine Sediment")}
+  if(parameter=="SSCCOARSE"){return("%SSC Coarse")}
+  if(parameter=="SSCFINE"){return("%SSC Fine")}
+  if(parameter=="SSCTOTAL" ){return("SSC Course + SSC Fine Combined")}
+  if(parameter=="LRBS"){return("Logged Relative Bed Stability")}
+  if(parameter=="Slope"){return("% Slope")} 
+  if(parameter=="FN_PCT"){return("% Fine Sediment")}
+  if(parameter=="SA_PCT"){return("% Sand")}
+  if(parameter=="SA_FN_PCT"){return("%Fine + %Sand")}
+  if(parameter=="LSUB_DMM"){return("Logged Mean Particle Size in Reach")}
+  if(parameter=="BL_CB_GR_Embed_PCT"){return("% Embeddedness of Bolders,Cobbles, and Gravels")}
+  if(parameter=="Embed_PCT"){return("% Embeddedness All Particles")}
+  if(parameter=="TotHab"){return("Total Habitat Score (RBP) ")}
+  if(parameter=="TotHab_wMD"){return("Total Habitat Score (with MD) (RBP_MD conversion) ")}
+  if(parameter=="MetalCCU"){return("Metal chronic criterion unit (Index of multiple metals)")}
+}
+
+```
+
+
+
+### Storing the data and plots
+Now that the functions are built to roll through making CDF and GAM plots for each taxa across various stressors, we can run through stressors to create plots and bring into Attribution workshop shiny app. The CDF data will be run but the plots will be generated using plotly in the app for interactive features. TITAN plots will be stored as flat files like the GAM/rel abundance.
+*Note* One must make necessary file structure in Windows explorer first for the functions to behave as expected.
+```{r}
+
+# Save CDF data
+cdfdataDO <- CDF(merge(fishTaxa,select(envData,UID,DO),by='UID') %>%
+                   filter(!is.na(DO)),'DO')
+cdfdataDO_Mountain <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Mountain') %>%
+                                  select(UID,DO),by='UID') %>%
+                           filter(!is.na(DO)),'DO')
+cdfdataDO_Piedmont <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Piedmont') %>%
+                                  select(UID,DO),by='UID') %>%
+                           filter(!is.na(DO)),'DO')
+                                  
+cdfdataDO_Coast <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Coast') %>%
+                               select(UID,DO),by='UID') %>%
+                           filter(!is.na(DO)),'DO')
+saveRDS(cdfdataDO,'FinalDataAndPlots/Fish/CDF/cdfdataDO.RDS')
+saveRDS(cdfdataDO_Mountain,'FinalDataAndPlots/Fish/Bioregion/Mountain/CDF/cdfdataDO.RDS')
+saveRDS(cdfdataDO_Piedmont,'FinalDataAndPlots/Fish/Bioregion/Piedmont/CDF/cdfdataDO.RDS')
+saveRDS(cdfdataDO_Coast,'FinalDataAndPlots/Fish/Bioregion/Coast/CDF/cdfdataDO.RDS')
+
+cdfdatapH <- CDF(merge(fishTaxa,select(envData,UID,pH),by='UID') %>%
+                   filter(!is.na(pH)),'pH')
+cdfdatapH_Mountain <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Mountain') %>%
+                                  select(UID,pH),by='UID') %>%
+                           filter(!is.na(pH)),'pH')
+cdfdatapH_Piedmont <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Piedmont') %>%
+                                  select(UID,pH),by='UID') %>%
+                           filter(!is.na(pH)),'pH')
+                                  
+cdfdatapH_Coast <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Coast') %>%
+                               select(UID,pH),by='UID') %>%
+                           filter(!is.na(pH)),'pH')
+saveRDS(cdfdatapH,'FinalDataAndPlots/Fish/CDF/cdfdatapH.RDS')
+saveRDS(cdfdatapH_Mountain,'FinalDataAndPlots/Fish/Bioregion/Mountain/CDF/cdfdatapH.RDS')
+saveRDS(cdfdatapH_Piedmont,'FinalDataAndPlots/Fish/Bioregion/Piedmont/CDF/cdfdatapH.RDS')
+saveRDS(cdfdatapH_Coast,'FinalDataAndPlots/Fish/Bioregion/Coast/CDF/cdfdatapH.RDS')
+
+cdfdataSpCond <- CDF(merge(fishTaxa,select(envData,UID,SpCond),by='UID') %>%
+                   filter(!is.na(SpCond)),'SpCond')
+cdfdataSpCond_Mountain <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Mountain') %>%
+                                  select(UID,SpCond),by='UID') %>%
+                           filter(!is.na(SpCond)),'SpCond')
+cdfdataSpCond_Piedmont <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Piedmont') %>%
+                                  select(UID,SpCond),by='UID') %>%
+                           filter(!is.na(SpCond)),'SpCond')
+                                  
+cdfdataSpCond_Coast <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Coast') %>%
+                               select(UID,SpCond),by='UID') %>%
+                           filter(!is.na(SpCond)),'SpCond')
+saveRDS(cdfdataSpCond,'FinalDataAndPlots/Fish/CDF/cdfdataSpCond.RDS')
+saveRDS(cdfdataSpCond_Mountain,'FinalDataAndPlots/Fish/Bioregion/Mountain/CDF/cdfdataSpCond.RDS')
+saveRDS(cdfdataSpCond_Piedmont,'FinalDataAndPlots/Fish/Bioregion/Piedmont/CDF/cdfdataSpCond.RDS')
+saveRDS(cdfdataSpCond_Coast,'FinalDataAndPlots/Fish/Bioregion/Coast/CDF/cdfdataSpCond.RDS')
+                         
+cdfdataLRBS <- CDF(merge(fishTaxa,select(envData,UID,LRBS),by='UID') %>%
+                   filter(!is.na(LRBS)),'LRBS')
+cdfdataLRBS_Mountain <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Mountain') %>%
+                                  select(UID,LRBS),by='UID') %>%
+                           filter(!is.na(LRBS)),'LRBS')
+cdfdataLRBS_Piedmont <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Piedmont') %>%
+                                  select(UID,LRBS),by='UID') %>%
+                           filter(!is.na(LRBS)),'LRBS')
+                                  
+cdfdataLRBS_Coast <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Coast') %>%
+                               select(UID,LRBS),by='UID') %>%
+                           filter(!is.na(LRBS)),'LRBS')
+saveRDS(cdfdataLRBS,'FinalDataAndPlots/Fish/CDF/cdfdataLRBS.RDS')
+saveRDS(cdfdataLRBS_Mountain,'FinalDataAndPlots/Fish/Bioregion/Mountain/CDF/cdfdataLRBS.RDS')
+saveRDS(cdfdataLRBS_Piedmont,'FinalDataAndPlots/Fish/Bioregion/Piedmont/CDF/cdfdataLRBS.RDS')
+saveRDS(cdfdataLRBS_Coast,'FinalDataAndPlots/Fish/Bioregion/Coast/CDF/cdfdataLRBS.RDS')
+
+
+cdfdataTP <- CDF(merge(fishTaxa,select(envData,UID,TP),by='UID') %>%
+                   filter(!is.na(TP)),'TP')
+cdfdataTP_Mountain <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Mountain') %>%
+                                  select(UID,TP),by='UID') %>%
+                           filter(!is.na(TP)),'TP')
+cdfdataTP_Piedmont <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Piedmont') %>%
+                                  select(UID,TP),by='UID') %>%
+                           filter(!is.na(TP)),'TP')
+                                  
+cdfdataTP_Coast <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Coast') %>%
+                               select(UID,TP),by='UID') %>%
+                           filter(!is.na(TP)),'TP')
+saveRDS(cdfdataTP,'FinalDataAndPlots/Fish/CDF/cdfdataTP.RDS')
+saveRDS(cdfdataTP_Mountain,'FinalDataAndPlots/Fish/Bioregion/Mountain/CDF/cdfdataTP.RDS')
+saveRDS(cdfdataTP_Piedmont,'FinalDataAndPlots/Fish/Bioregion/Piedmont/CDF/cdfdataTP.RDS')
+saveRDS(cdfdataTP_Coast,'FinalDataAndPlots/Fish/Bioregion/Coast/CDF/cdfdataTP.RDS')
+
+cdfdataTN <- CDF(merge(fishTaxa,select(envData,UID,TN),by='UID') %>%
+                   filter(!is.na(TN)),'TN')
+cdfdataTN_Mountain <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Mountain') %>%
+                                  select(UID,TN),by='UID') %>%
+                           filter(!is.na(TN)),'TN')
+cdfdataTN_Piedmont <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Piedmont') %>%
+                                  select(UID,TN),by='UID') %>%
+                           filter(!is.na(TN)),'TN')
+                                  
+cdfdataTN_Coast <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Coast') %>%
+                               select(UID,TN),by='UID') %>%
+                           filter(!is.na(TN)),'TN')
+saveRDS(cdfdataTN,'FinalDataAndPlots/Fish/CDF/cdfdataTN.RDS')
+saveRDS(cdfdataTN_Mountain,'FinalDataAndPlots/Fish/Bioregion/Mountain/CDF/cdfdataTN.RDS')
+saveRDS(cdfdataTN_Piedmont,'FinalDataAndPlots/Fish/Bioregion/Piedmont/CDF/cdfdataTN.RDS')
+saveRDS(cdfdataTN_Coast,'FinalDataAndPlots/Fish/Bioregion/Coast/CDF/cdfdataTN.RDS')
+
+cdfdataTotHab <- CDF(merge(fishTaxa,select(envData,UID,TotHab),by='UID') %>%
+                   filter(!is.na(TotHab)),'TotHab')
+cdfdataTotHab_Mountain <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Mountain') %>%
+                                  select(UID,TotHab),by='UID') %>%
+                           filter(!is.na(TotHab)),'TotHab')
+cdfdataTotHab_Piedmont <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Piedmont') %>%
+                                  select(UID,TotHab),by='UID') %>%
+                           filter(!is.na(TotHab)),'TotHab')
+                                  
+cdfdataTotHab_Coast <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Coast') %>%
+                               select(UID,TotHab),by='UID') %>%
+                           filter(!is.na(TotHab)),'TotHab')
+saveRDS(cdfdataTotHab,'FinalDataAndPlots/Fish/CDF/cdfdataTotHab.RDS')
+saveRDS(cdfdataTotHab_Mountain,'FinalDataAndPlots/Fish/Bioregion/Mountain/CDF/cdfdataTotHab.RDS')
+saveRDS(cdfdataTotHab_Piedmont,'FinalDataAndPlots/Fish/Bioregion/Piedmont/CDF/cdfdataTotHab.RDS')
+saveRDS(cdfdataTotHab_Coast,'FinalDataAndPlots/Fish/Bioregion/Coast/CDF/cdfdataTotHab.RDS')
+
+cdfdatawshdImpPCT <- CDF(merge(fishTaxa,select(envData,UID,wshdImpPCT),by='UID') %>%
+                   filter(!is.na(wshdImpPCT)),'wshdImpPCT')
+cdfdatawshdImpPCT_Mountain <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Mountain') %>%
+                                  select(UID,wshdImpPCT),by='UID') %>%
+                           filter(!is.na(wshdImpPCT)),'wshdImpPCT')
+cdfdatawshdImpPCT_Piedmont <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Piedmont') %>%
+                                  select(UID,wshdImpPCT),by='UID') %>%
+                           filter(!is.na(wshdImpPCT)),'wshdImpPCT')
+                                  
+cdfdatawshdImpPCT_Coast <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Coast') %>%
+                               select(UID,wshdImpPCT),by='UID') %>%
+                           filter(!is.na(wshdImpPCT)),'wshdImpPCT')
+saveRDS(cdfdatawshdImpPCT,'FinalDataAndPlots/Fish/CDF/cdfdatawshdImpPCT.RDS')
+saveRDS(cdfdatawshdImpPCT_Mountain,'FinalDataAndPlots/Fish/Bioregion/Mountain/CDF/cdfdatawshdImpPCT.RDS')
+saveRDS(cdfdatawshdImpPCT_Piedmont,'FinalDataAndPlots/Fish/Bioregion/Piedmont/CDF/cdfdatawshdImpPCT.RDS')
+saveRDS(cdfdatawshdImpPCT_Coast,'FinalDataAndPlots/Fish/Bioregion/Coast/CDF/cdfdatawshdImpPCT.RDS')
+
+cdfdataTotHab_wMD <- CDF(merge(fishTaxa,select(envData,UID,TotHab_wMD),by='UID') %>%
+                   filter(!is.na(TotHab_wMD)),'TotHab_wMD')
+cdfdataTotHab_wMD_Mountain <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Mountain') %>%
+                                  select(UID,TotHab_wMD),by='UID') %>%
+                           filter(!is.na(TotHab_wMD)),'TotHab_wMD')
+cdfdataTotHab_wMD_Piedmont <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Piedmont') %>%
+                                  select(UID,TotHab_wMD),by='UID') %>%
+                           filter(!is.na(TotHab_wMD)),'TotHab_wMD')
+                                  
+cdfdataTotHab_wMD_Coast <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Coast') %>%
+                               select(UID,TotHab_wMD),by='UID') %>%
+                           filter(!is.na(TotHab_wMD)),'TotHab_wMD')
+saveRDS(cdfdataTotHab_wMD,'FinalDataAndPlots/Fish/CDF/cdfdataTotHab_wMD.RDS')
+saveRDS(cdfdataTotHab_wMD_Mountain,'FinalDataAndPlots/Fish/Bioregion/Mountain/CDF/cdfdataTotHab_wMD.RDS')
+saveRDS(cdfdataTotHab_wMD_Piedmont,'FinalDataAndPlots/Fish/Bioregion/Piedmont/CDF/cdfdataTotHab_wMD.RDS')
+saveRDS(cdfdataTotHab_wMD_Coast,'FinalDataAndPlots/Fish/Bioregion/Coast/CDF/cdfdataTotHab_wMD.RDS')
+
+cdfdataSf <- CDF(merge(fishTaxa,select(envData,UID,Sf),by='UID') %>%
+                   filter(!is.na(Sf)),'Sf')
+cdfdataSf_Mountain <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Mountain') %>%
+                                  select(UID,Sf),by='UID') %>%
+                           filter(!is.na(Sf)),'Sf')
+cdfdataSf_Piedmont <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Piedmont') %>%
+                                  select(UID,Sf),by='UID') %>%
+                           filter(!is.na(Sf)),'Sf')
+                                  
+cdfdataSf_Coast <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Coast') %>%
+                               select(UID,Sf),by='UID') %>%
+                           filter(!is.na(Sf)),'Sf')
+saveRDS(cdfdataSf,'FinalDataAndPlots/Fish/CDF/cdfdataSf.RDS')
+saveRDS(cdfdataSf_Mountain,'FinalDataAndPlots/Fish/Bioregion/Mountain/CDF/cdfdataSf.RDS')
+saveRDS(cdfdataSf_Piedmont,'FinalDataAndPlots/Fish/Bioregion/Piedmont/CDF/cdfdataSf.RDS')
+saveRDS(cdfdataSf_Coast,'FinalDataAndPlots/Fish/Bioregion/Coast/CDF/cdfdataSf.RDS')
+
+cdfdataCl <- CDF(merge(fishTaxa,select(envData,UID,Cl),by='UID') %>%
+                   filter(!is.na(Cl)),'Cl')
+cdfdataCl_Mountain <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Mountain') %>%
+                                  select(UID,Cl),by='UID') %>%
+                           filter(!is.na(Cl)),'Cl')
+cdfdataCl_Piedmont <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Piedmont') %>%
+                                  select(UID,Cl),by='UID') %>%
+                           filter(!is.na(Cl)),'Cl')
+                                  
+cdfdataCl_Coast <- CDF(merge(fishTaxa,filter(envData,BioRegion=='Coast') %>%
+                               select(UID,Cl),by='UID') %>%
+                           filter(!is.na(Cl)),'Cl')
+saveRDS(cdfdataCl,'FinalDataAndPlots/Fish/CDF/cdfdataCl.RDS')
+saveRDS(cdfdataCl_Mountain,'FinalDataAndPlots/Fish/Bioregion/Mountain/CDF/cdfdataCl.RDS')
+saveRDS(cdfdataCl_Piedmont,'FinalDataAndPlots/Fish/Bioregion/Piedmont/CDF/cdfdataCl.RDS')
+saveRDS(cdfdataCl_Coast,'FinalDataAndPlots/Fish/Bioregion/Coast/CDF/cdfdataCl.RDS')
+
+
+
+
+
+
+parameters <- c("DO","pH","SpCond","LRBS","TP","TN","wshdImpPCT","TotHab",'TotHab_wMD','Sf','Cl')#,"MetalCCU")
+parametersToAnalyze <- which( colnames(envData) %in% parameters)
+
+# GAM/relative Risk plots
+for(i in parametersToAnalyze){
+  z <- tolerance(spdata=gather(fishTaxa,GENUS,RA,-UID),
+                 envdata = select(envData,UID,names(envData)[i]),
+                 sp.siteid="UID" ,species="GENUS",sp.abndid="RA",env.siteid="UID",
+                 xvar=as.character(names(envData)[i]),
+                 cutoff = 10,
+                 cutoff2 = 10,
+                 region = "all",lim ="GAM",coord = NULL,mtype = 3,dense.N = 201,
+                 cast = TRUE  ,plot.pdf = T,add.map=F,statename = NULL,
+                 add.lab = F,add.abund = T,
+                 ylab1 = "Capture Probability",ylab2 = "Relative Abundance",
+                 main = "Capture Probability of Fish Taxon Along Conductivity Gradient",
+                 mar = c(5,4,3, 4),
+                 xlabs=prettyXlabel(names(envData)[i]),
+                 log.x = FALSE,
+                 base = 10,plus = F,rounder = 2,taus = c(50,95),nbin = 60,
+                 emmaLOG = ifelse(i %in% c(14,15,16,19,20,23),TRUE,FALSE))
+  saveRDS(z,paste('FinalDataAndPlots/Fish/GAM/',as.character(names(envData)[i]),'/',
+                  as.character(names(envData)[i]),'.RDS',sep=''))
+  
+  # Mountain
+  y <- tolerance_bioregion(spdata=gather(fishTaxa,GENUS,RA,-UID),
+                           envdata = filter(envData, BioRegion=='Mountain') %>%
+                             select(UID,names(envData)[i]) %>% filter(!is.na(.[[2]])),
+                 sp.siteid="UID" ,species="GENUS",sp.abndid="RA",env.siteid="UID",
+                 xvar=as.character(names(envData)[i]),
+                 cutoff = 10,
+                 cutoff2 = 10,
+                 region = "all",lim ="GAM",coord = NULL,mtype = 3,dense.N = 201,
+                 cast = TRUE  ,plot.pdf = T,add.map=F,statename = NULL,
+                 add.lab = F,
+                 
+                 bioregion = 'Mountain',
+                 
+                 add.abund = T,
+                 ylab1 = "Capture Probability",ylab2 = "Relative Abundance",
+                 main = "Capture Probability of Fish Taxon Along Conductivity Gradient",
+                 mar = c(5,4,3, 4),
+                 xlabs=prettyXlabel(names(envData)[i]),
+                 log.x = FALSE,
+                 base = 10,plus = F,rounder = 2,taus = c(50,95),nbin = 60,
+                 emmaLOG = ifelse(i %in% c(14,15,16,19,20,23),TRUE,FALSE))
+                 
+  saveRDS(y,paste('FinalDataAndPlots/Fish/Bioregion/Mountain/GAM/',as.character(names(envData)[i]),'/',
+                  as.character(names(envData)[i]),'.RDS',sep=''))
+  
+  
+   # Piedmont
+  x <- tolerance_bioregion(spdata=gather(fishTaxa,GENUS,RA,-UID),
+                           envdata = filter(envData, BioRegion=='Piedmont') %>%
+                             select(UID,names(envData)[i]) %>% filter(!is.na(.[[2]])),
+                 sp.siteid="UID" ,species="GENUS",sp.abndid="RA",env.siteid="UID",
+                 xvar=as.character(names(envData)[i]),
+                 cutoff = 10,
+                 cutoff2 = 10,
+                 region = "all",lim ="GAM",coord = NULL,mtype = 3,dense.N = 201,
+                 cast = TRUE  ,plot.pdf = T,add.map=F,statename = NULL,
+                 add.lab = F,
+                 
+                 bioregion = 'Piedmont',
+                 
+                 add.abund = T,
+                 ylab1 = "Capture Probability",ylab2 = "Relative Abundance",
+                 main = "Capture Probability of Fish Taxon Along Conductivity Gradient",
+                 mar = c(5,4,3, 4),
+                 xlabs=prettyXlabel(names(envData)[i]),
+                 log.x = FALSE,
+                 base = 10,plus = F,rounder = 2,taus = c(50,95),nbin = 60,
+                 emmaLOG = ifelse(i %in% c(14,15,16,19,20,23),TRUE,FALSE))
+                 
+  saveRDS(x,paste('FinalDataAndPlots/Fish/Bioregion/Piedmont/GAM/',as.character(names(envData)[i]),'/',
+                  as.character(names(envData)[i]),'.RDS',sep=''))
+  
+  # Coast
+  w <- tolerance_bioregion(spdata=gather(fishTaxa,GENUS,RA,-UID),
+                           envdata = filter(envData, BioRegion=='Coast') %>%
+                             select(UID,names(envData)[i]) %>% filter(!is.na(.[[2]])),
+                 sp.siteid="UID" ,species="GENUS",sp.abndid="RA",env.siteid="UID",
+                 xvar=as.character(names(envData)[i]),
+                 cutoff = 10,
+                 cutoff2 = 10,
+                 region = "all",lim ="GAM",coord = NULL,mtype = 3,dense.N = 201,
+                 cast = TRUE  ,plot.pdf = T,add.map=F,statename = NULL,
+                 add.lab = F,
+                 
+                 bioregion = 'Coast',
+                 
+                 add.abund = T,
+                 ylab1 = "Capture Probability",ylab2 = "Relative Abundance",
+                 main = "Capture Probability of Fish Taxon Along Conductivity Gradient",
+                 mar = c(5,4,3, 4),
+                 xlabs=prettyXlabel(names(envData)[i]),
+                 log.x = FALSE,
+                 base = 10,plus = F,rounder = 2,taus = c(50,95),nbin = 60,
+                 emmaLOG = ifelse(i %in% c(14,15,16,19,20,23),TRUE,FALSE))
+                 
+  saveRDS(w,paste('FinalDataAndPlots/Fish/Bioregion/Coast/GAM/',as.character(names(envData)[i]),'/',
+                  as.character(names(envData)[i]),'.RDS',sep=''))
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Titan Section
+Read in taxa data
+```{r}
+taxaList <- fishTaxa
+  #readxl::read_excel('Jason/FishSpecies.xlsx',sheet='AllTaxa') %>%
+  #select(StationID,Year,`Acantharchus  pomotis`:`Umbra  pygmaea`)
+```
+
+
+Read in environmental data. The environmental data must be a single parameter for each TITAN run.
+```{r}
+envData <- envData
+  #readxl::read_excel('Jason/EnviroData.xlsx',sheet='stessorData') %>%
+  #select(StationID, Year, DO:TotHab,MetalCCU)#, CALCIUM:MERCURY)
+```
+
+Make sure merged datasets match Jason's merge attempt. It did, won't keep rerunning
+```{r}
+combined <- merge(envData,taxaList,by=c('UID')) #%>% 
+#  mutate(UID=paste(StationID,Year,sep="_"))
+#JasonMerge <- readxl::read_excel('Jason/FishMatch.xlsx') %>% 
+#  mutate(StationID= stessorData.StationID, Year = stessorData.Year)
+
+#test <- full_join(combined,JasonMerge,by=c('StationID','Year'))
+#length(unique(test$UID)) == nrow(test) # if that == the nrow of test then we are good
+
+#saveRDS(combined,'data/FishTaxaEnv.RDS')
+```
+
+
+Make a taxa dataset that can be used in TITAN model. Essentially, combine StationID and Year columns to make a unique identifier that will be matched to envData. Must have min 3 taxon occurrence to run TITAN, paper suggests 5 but I went with 3 to be most inclusive of our data. Open to discussion.
+
+```{r}
+taxaListPrep <- #mutate(taxaList,UID=paste(StationID,Year,sep="_")) %>%
+  filter(taxaList,UID %in% combined$UID) #%>%
+  #select(-c(StationID,Year)) %>% select(UID,everything())
+
+taxonOccurrence <- taxaListPrep %>%
+  gather(taxaName,count,-UID) %>%
+  mutate(taxonOccur= ifelse(count>1,1,0)) %>%
+  filter(taxonOccur != 0) %>%
+  group_by(taxaName)%>%
+  summarise(ntaxInDB= sum(taxonOccur)) %>% 
+  filter(ntaxInDB >= 5)
+
+validTaxaList <- select(taxaListPrep,UID,taxonOccurrence$taxaName) %>%
+  as.data.frame()
+```
+
+Now match envData to validTaxaList. Change rownames to UID for TITAN. That last bit cost me hours to figure out.
+```{r}
+validEnvData <- #mutate(envData,UID=paste(StationID,Year,sep="_")) %>%
+  filter(envData,UID %in% validTaxaList$UID) %>%
+  #select(-c(StationID,Year)) %>%
+  as.data.frame()
+row.names(validEnvData) <- validEnvData$UID
+validEnvData <- select(validEnvData,-UID) 
+row.names(validTaxaList) <- validTaxaList$UID
+validTaxaList <- select(validTaxaList,-UID)
+```
+
+
+How to run all the TITAN models and save data and plots for later analysis.
+```{r}
+for(i in 11:length(validEnvData)){
+  stressor <- names(validEnvData)[i]
+  result <- titan(validEnvData[,i],validTaxaList,minSplt = 5)
+  saveRDS(result,paste(stressor,'TITAN.RDS',sep="_"))
+  
+  titan(glades.env, glades.taxa, minSplt = 5,
+  numPerm = 250, boot = TRUE, nBoot = 500, imax = FALSE,
+  ivTot = FALSE, pur.cut = 0.95, rel.cut = 0.95, ncpus = 1, memory = FALSE)
+  
+  stressor <- names(validEnvData)[i]
+  envForTitan <- data.frame(validEnvData[,i])
+  names(envForTitan) <- stressor
+  
+  result <- titan(envForTitan,data.frame(validTaxaList),
+                  minSplt = 5, numPerm = 5, boot = FALSE)#TRUE, nBoot = 5, memory = TRUE)
+  # Save Taxa plot
+  #for(k in 1:length()){
+  #  file_name <- paste('TestDataAndPlots/Fish/Titan/',stressor,'/',tnames[k],'.jpg',sep='')
+  #  jpeg(file_name)
+  #  #plotTaxa(result,xlabel = prettyXlabel(parameter))
+  #  dev.off()
+  #}
+      
+  
+}
+```
+
